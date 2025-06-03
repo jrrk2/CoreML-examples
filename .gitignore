@@ -1,0 +1,11 @@
+*.dSYM/
+*~
+*.mlpackage/
+*.mlmodelc/
+compile_and_run
+debug_inference
+method_inspector
+minimal_test
+simple_tokenizer
+stateful_test
+.DS_Store
