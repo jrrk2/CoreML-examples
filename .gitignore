@@ -8,4 +8,6 @@ method_inspector
 minimal_test
 simple_tokenizer
 stateful_test
+interactive_engine
+sliding_window_llama
 .DS_Store

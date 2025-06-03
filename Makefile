@@ -115,5 +115,21 @@ test-compile: model_compiler
 test-run: compile_and_run
 	./$< llama-2-7b-chat.mlpackage "Hello, how are you?"
 
+# Add to your Makefile
+interactive_engine: interactive_llama_engine.mm
+	@echo "🔨 Building interactive_llama_engine..."
+	$(CXX) $(OBJCXX_FLAGS) $(RELEASE_FLAGS) $(FRAMEWORKS) -o $@ $<
+
+test-inter: interactive_engine
+	./$< llama-2-7b-chat.mlpackage
+
+sliding_window_llama: sliding_window_llama.mm
+	@echo "🔨 Building $@..."
+	$(CXX) $(OBJCXX_FLAGS) $(RELEASE_FLAGS) $(FRAMEWORKS) -o $@ $<
+
+# Then run
+test-slide: sliding_window_llama
+	./$< llama-2-7b-chat.mlpackage
+
 # Mark phony targets
 .PHONY: all clean install help test-debug test-compile
