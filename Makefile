@@ -112,5 +112,8 @@ test-compile: model_compiler
 		echo "⚠️  No test model found"; \
 	fi
 
+test-run: compile_and_run
+	./$< llama-2-7b-chat.mlpackage "Hello, how are you?"
+
 # Mark phony targets
 .PHONY: all clean install help test-debug test-compile
