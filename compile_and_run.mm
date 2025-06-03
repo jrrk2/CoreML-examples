@@ -1,6 +1,6 @@
 //
-//  fresh_compile_and_run.mm
-//  Clean CoreML Llama pipeline with proper tokenization
+//  compile_and_run.mm
+//  Fixed CoreML Llama pipeline with proper autoregressive generation
 //
 
 #import <Foundation/Foundation.h>
@@ -57,10 +57,18 @@ NSString* detokenizeWithVocab(NSInteger tokenId, NSDictionary *vocab) {
     return [NSString stringWithFormat:@"[UNK_%ld]", tokenId];
 }
 
+// Check if token is EOS or should stop generation
+BOOL shouldStopGeneration(NSInteger tokenId) {
+    // Common stop tokens for LLaMA models
+    return (tokenId == 2 ||      // </s> (EOS)
+            tokenId == 0 ||      // <unk> 
+            tokenId == 1);       // <s> (shouldn't appear mid-generation)
+}
+
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         if (argc < 3) {
-            printf("Usage: ./fresh_compile_and_run <model.mlpackage> <prompt>\n");
+            printf("Usage: ./compile_and_run <model.mlpackage> <prompt>\n");
             return 1;
         }
         
@@ -122,34 +130,35 @@ int main(int argc, const char * argv[]) {
         printf("🔤 Chat format: %s\n", chatPrompt.UTF8String);
         
         // Proper tokens for "[INST] Hello, how are you? [/INST]"
-        NSArray *tokens = @[@(1),      // <s>
-                           @(518),     // [
-                           @(25580),   // INST
-                           @(29962),   // ]
-                           @(15043),   // Hello
-                           @(29892),   // ,
-                           @(920),     // how
-                           @(526),     // are
-                           @(366),     // you
-                           @(29973),   // ?
-                           @(518),     // [
-                           @(29914),   // /
-                           @(25580),   // INST
-                           @(29962)];  // ]
+        NSMutableArray *currentTokens = [@[@(1),      // <s>
+                                          @(518),     // [
+                                          @(25580),   // INST
+                                          @(29962),   // ]
+                                          @(15043),   // Hello
+                                          @(29892),   // ,
+                                          @(920),     // how
+                                          @(526),     // are
+                                          @(366),     // you
+                                          @(29973),   // ?
+                                          @(518),     // [
+                                          @(29914),   // /
+                                          @(25580),   // INST
+                                          @(29962)] mutableCopy];  // ]
         
-        printf("🔤 Using %lu tokens\n", (unsigned long)tokens.count);
+        printf("🔤 Using %lu initial tokens\n", (unsigned long)currentTokens.count);
         
         // Get model input requirements
         NSDictionary *inputDesc = model.modelDescription.inputDescriptionsByName;
         MLFeatureDescription *inputIdsDesc = inputDesc[@"input_ids"];
-        NSInteger seqLength = 64; // Default
+        NSInteger seqLength = 512; // Increased from 64 to give more room
         
         if (inputIdsDesc.multiArrayConstraint.shape.count >= 2) {
-            seqLength = [inputIdsDesc.multiArrayConstraint.shape[1] integerValue];
+            NSInteger modelSeqLength = [inputIdsDesc.multiArrayConstraint.shape[1] integerValue];
+            seqLength = MIN(seqLength, modelSeqLength); // Don't exceed model capacity
         }
         printf("📐 Sequence length: %ld\n", seqLength);
         
-        // Create input tensors
+        // Create input tensors (reusable)
         NSError *inputError = nil;
         MLMultiArray *inputIds = [[MLMultiArray alloc] initWithShape:@[@(1), @(seqLength)] 
                                                             dataType:MLMultiArrayDataTypeInt32 
@@ -159,21 +168,33 @@ int main(int argc, const char * argv[]) {
                                                                  dataType:MLMultiArrayDataTypeInt32 
                                                                     error:&inputError];
         
-        // Fill tensors
-        for (NSInteger i = 0; i < seqLength; i++) {
-            NSInteger tokenId = 1; // Default padding with <s>
-            NSInteger maskValue = 0; // Default: don't attend to padding
-            
-            if (i < tokens.count) {
-                tokenId = [tokens[i] integerValue];
-                maskValue = 1; // Attend to real tokens
-            }
-            
-            inputIds[@[@(0), @(i)]] = @(tokenId);
-            attentionMask[@[@(0), @(i)]] = @(maskValue);
+        if (!inputIds || !attentionMask) {
+            printf("❌ Input tensor creation failed\n");
+            return 1;
         }
         
-        // Create feature provider
+        printf("✅ Input tensors created\n");
+        
+        // Function to update input tensors with current token sequence
+        void (^updateInputTensors)(void) = ^{
+            // Clear tensors
+            for (NSInteger i = 0; i < seqLength; i++) {
+                inputIds[@[@(0), @(i)]] = @(1); // Pad with <s>
+                attentionMask[@[@(0), @(i)]] = @(0); // Don't attend to padding
+            }
+            
+            // Fill with current tokens
+            NSInteger tokenCount = MIN(currentTokens.count, seqLength);
+            for (NSInteger i = 0; i < tokenCount; i++) {
+                inputIds[@[@(0), @(i)]] = currentTokens[i];
+                attentionMask[@[@(0), @(i)]] = @(1); // Attend to real tokens
+            }
+        };
+        
+        // Initial setup
+        updateInputTensors();
+        
+        // Create feature provider (reusable)
         MLDictionaryFeatureProvider *input = [[MLDictionaryFeatureProvider alloc] 
             initWithDictionary:@{
                 @"input_ids": [MLFeatureValue featureValueWithMultiArray:inputIds],
@@ -186,102 +207,97 @@ int main(int argc, const char * argv[]) {
         }
         
         printf("✅ Input prepared: %lu real tokens, %ld padding\n", 
-               (unsigned long)tokens.count, seqLength - tokens.count);
+               (unsigned long)currentTokens.count, seqLength - currentTokens.count);
         
-        // Run inference
-        printf("\n🧠 Running inference...\n");
-        NSDate *start = [NSDate date];
+        // Autoregressive generation loop
+        printf("\n🧠 Running autoregressive generation...\n");
+        NSMutableString *generatedText = [NSMutableString string];
+        NSInteger maxNewTokens = 50; // Generate up to 50 new tokens
         
-        MLPredictionOptions *options = [[MLPredictionOptions alloc] init];
-        id<MLFeatureProvider> result = [model predictionFromFeatures:input 
-                                                              options:options 
-                                                                error:&loadError];
-        
-        double inferTime = [[NSDate date] timeIntervalSinceDate:start];
-        
-        if (!result) {
-            printf("❌ Inference failed: %s\n", loadError.localizedDescription.UTF8String);
-            return 1;
-        }
-        
-        printf("✅ Inference completed in %.1f seconds\n", inferTime);
-        
-        // Process output and generate 10 tokens
-        printf("\n📊 Generating 10 tokens...\n");
-        MLFeatureValue *logits = [result featureValueForName:@"logits"];
-        
-        if (logits && logits.type == MLFeatureTypeMultiArray) {
-            MLMultiArray *logitsArray = logits.multiArrayValue;
-            printf("📐 Logits shape: %s\n", [logitsArray.shape.description UTF8String]);
-            
-            NSInteger vocabSize = [logitsArray.shape[2] integerValue];
-            NSMutableArray *generatedTokens = [NSMutableArray array];
-            NSMutableString *generatedText = [NSMutableString string];
-            
-            // Generate 10 tokens
-            for (NSInteger tokenStep = 0; tokenStep < 10; tokenStep++) {
-                // Find the position to predict from (last real token + generated tokens)
-                NSInteger predictionPos = tokens.count - 1 + tokenStep;
-                
-                if (predictionPos >= seqLength) {
-                    printf("⚠️  Reached sequence limit at token %ld\n", tokenStep);
-                    break;
-                }
-                
-                // Find best token at this position
-                float bestLogit = -INFINITY;
-                NSInteger bestToken = 0;
-                
-                for (NSInteger i = 0; i < vocabSize; i++) {
-                    NSNumber *logitVal = logitsArray[@[@(0), @(predictionPos), @(i)]];
-                    float logit = [logitVal floatValue];
-                    
-                    if (logit > bestLogit) {
-                        bestLogit = logit;
-                        bestToken = i;
-                    }
-                }
-                
-                [generatedTokens addObject:@(bestToken)];
-                
-                if (vocabulary) {
-                    NSString *tokenText = detokenizeWithVocab(bestToken, vocabulary);
-                    [generatedText appendString:tokenText];
-                    printf("🎯 Token %ld: %ld -> \"%s\" (%.3f)\n", 
-                           tokenStep + 1, bestToken, tokenText.UTF8String, bestLogit);
-                } else {
-                    printf("🎯 Token %ld: %ld (%.3f)\n", tokenStep + 1, bestToken, bestLogit);
-                }
+        for (NSInteger tokenStep = 0; tokenStep < maxNewTokens; tokenStep++) {
+            // Check if we're approaching sequence limit
+            if (currentTokens.count >= seqLength - 1) {
+                printf("⚠️  Reached sequence limit at token %ld\n", tokenStep);
+                break;
             }
             
-            printf("\n📝 Complete generated text: \"%s\"\n", generatedText.UTF8String);
+            // Run inference with current sequence
+            NSDate *start = [NSDate date];
             
-            // Show the top 3 alternatives for the first token
-            NSInteger firstPredPos = tokens.count - 1;
-            NSMutableArray *topTokens = [NSMutableArray array];
+            MLPredictionOptions *options = [[MLPredictionOptions alloc] init];
+            id<MLFeatureProvider> result = [model predictionFromFeatures:input 
+                                                                  options:options 
+                                                                    error:&loadError];
+            
+            double inferTime = [[NSDate date] timeIntervalSinceDate:start];
+            
+            if (!result) {
+                printf("❌ Inference failed at token %ld: %s\n", tokenStep, loadError.localizedDescription.UTF8String);
+                break;
+            }
+            
+            // Get logits for next token prediction
+            MLFeatureValue *logits = [result featureValueForName:@"logits"];
+            
+            if (!logits || logits.type != MLFeatureTypeMultiArray) {
+                printf("❌ Invalid logits output at token %ld\n", tokenStep);
+                break;
+            }
+            
+            MLMultiArray *logitsArray = logits.multiArrayValue;
+            NSInteger vocabSize = [logitsArray.shape[2] integerValue];
+            
+            // Predict next token from the last position in the sequence
+            NSInteger predictionPos = currentTokens.count - 1;
+            
+            // Find best token (greedy decoding)
+            float bestLogit = -INFINITY;
+            NSInteger bestToken = 0;
             
             for (NSInteger i = 0; i < vocabSize; i++) {
-                NSNumber *logitVal = logitsArray[@[@(0), @(firstPredPos), @(i)]];
-                [topTokens addObject:@{@"token": @(i), @"logit": logitVal}];
+                NSNumber *logitVal = logitsArray[@[@(0), @(predictionPos), @(i)]];
+                float logit = [logitVal floatValue];
+                
+                if (logit > bestLogit) {
+                    bestLogit = logit;
+                    bestToken = i;
+                }
             }
             
-            [topTokens sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                return [b[@"logit"] compare:a[@"logit"]];
-            }];
+            // Check for stop conditions
+            if (shouldStopGeneration(bestToken)) {
+                printf("🛑 Generation stopped at EOS token %ld\n", bestToken);
+                break;
+            }
             
-            printf("\n🌊 Wave function collapsed! But top 3 alternatives for first token were:\n");
-            for (NSInteger i = 0; i < MIN(3, topTokens.count); i++) {
-                NSDictionary *info = topTokens[i];
-                NSInteger tokenId = [info[@"token"] integerValue];
-                float logit = [info[@"logit"] floatValue];
-                if (vocabulary) {
-                    NSString *text = detokenizeWithVocab(tokenId, vocabulary);
-                    printf("  %ld. \"%s\" (%.3f)\n", i+1, text.UTF8String, logit);
+            // Add generated token to sequence
+            [currentTokens addObject:@(bestToken)];
+            
+            // Detokenize and display
+            if (vocabulary) {
+                NSString *tokenText = detokenizeWithVocab(bestToken, vocabulary);
+                [generatedText appendString:tokenText];
+                printf("🎯 Token %ld: %ld -> \"%s\" (%.3f) [%.1fms]\n", 
+                       tokenStep + 1, bestToken, tokenText.UTF8String, bestLogit, inferTime * 1000);
+            } else {
+                printf("🎯 Token %ld: %ld (%.3f) [%.1fms]\n", tokenStep + 1, bestToken, bestLogit, inferTime * 1000);
+            }
+            
+            // Update input tensors for next iteration
+            updateInputTensors();
+            
+            // Optional: Stop on certain tokens (like period for sentences)
+            if (vocabulary) {
+                NSString *tokenText = detokenizeWithVocab(bestToken, vocabulary);
+                if ([tokenText containsString:@"."] || [tokenText containsString:@"!"]) {
+                    // Continue for a bit more, don't stop immediately on punctuation
                 }
             }
         }
         
-        printf("\n🎉 Complete!\n");
+        printf("\n📝 Complete generated text: \"%s\"\n", generatedText.UTF8String);
+        printf("📊 Generated %lu new tokens\n", (unsigned long)(currentTokens.count - 14));
+        printf("\n🎉 Autoregressive generation complete!\n");
     }
     return 0;
 }
